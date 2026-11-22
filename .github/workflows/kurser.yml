@@ -49,8 +49,11 @@ jobs:
           key: privat-${{ github.run_id }}
           restore-keys: privat-
 
+      # Valgfri gratis «Demo»-nøkkel fra CoinGecko (Settings → Secrets → Actions), så krypto ikke får 429
       - name: Kursjobben
         run: node kursjobb.mjs ut privat
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
 
       - uses: actions/cache/save@v4
         if: always()

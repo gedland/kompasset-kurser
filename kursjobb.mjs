@@ -158,9 +158,255 @@ var init_krypto_yahoo = __esm({
   }
 });
 
+// src/lib/kurs/reserve-kilder.ts
+function lagHentTekst(logg, ms = 3e4) {
+  return (merke) => async (url) => {
+    try {
+      const r = await fetch(url, {
+        headers: { "User-Agent": UA, Accept: "application/json, text/plain, */*" },
+        signal: AbortSignal.timeout(ms)
+      });
+      if (!r.ok) {
+        logg[merke] = "HTTP " + r.status;
+        return null;
+      }
+      return await r.text();
+    } catch (e) {
+      logg[merke] = e instanceof Error ? e.name + ": " + e.message : String(e);
+      return null;
+    }
+  };
+}
+function sonetid(dato, hh, mm, sone) {
+  const [a, m, d] = dato.split("-").map(Number);
+  const gjett = Date.UTC(a, m - 1, d, hh, mm);
+  const del = new Intl.DateTimeFormat("en-US", {
+    timeZone: sone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).formatToParts(new Date(gjett));
+  const f = (t) => Number(del.find((x) => x.type === t)?.value);
+  const lokal = Date.UTC(f("year"), f("month") - 1, f("day"), f("hour"), f("minute"));
+  return Math.round((gjett - (lokal - gjett)) / 1e3);
+}
+function lokalt(nu, sone) {
+  const del = new Intl.DateTimeFormat("en-CA", {
+    timeZone: sone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "short"
+  }).formatToParts(new Date(nu));
+  const f = (t) => del.find((x) => x.type === t)?.value ?? "";
+  return {
+    dato: `${f("year")}-${f("month")}-${f("day")}`,
+    min: Number(f("hour")) * 60 + Number(f("minute")),
+    helg: f("weekday") === "Sat" || f("weekday") === "Sun"
+  };
+}
+function sesjonstid(nu, sone, apner, stenger, forsinkelseMin = 15) {
+  const l = lokalt(nu, sone);
+  const a = apner[0] * 60 + apner[1], s = stenger[0] * 60 + stenger[1];
+  if (!l.helg && l.min >= a && l.min < s + forsinkelseMin)
+    return Math.floor(nu / 1e3) - forsinkelseMin * 60;
+  let t = nu;
+  if (l.helg || l.min < a) t -= 864e5;
+  for (let i = 0; i < 4 && lokalt(t, sone).helg; i++) t -= 864e5;
+  return sonetid(lokalt(t, sone).dato, stenger[0], stenger[1], sone);
+}
+function lesNorgesBank(tekst) {
+  const ut = /* @__PURE__ */ new Map();
+  const d = JSON.parse(tekst)?.data;
+  const st = d?.structure, ds = d?.dataSets?.[0];
+  if (!st || !ds) return ut;
+  const dims = st.dimensions.series;
+  const qi = dims.findIndex((x) => x.id === "BASE_CUR");
+  const datoer = st.dimensions.observation[0].values.map((v) => v.id);
+  const attr = st.attributes.series;
+  const mi = attr.findIndex((a) => a.id === "UNIT_MULT");
+  for (const [nokkel, s] of Object.entries(ds.series)) {
+    const kode = dims[qi]?.values[Number(nokkel.split(":")[qi])]?.id;
+    if (!kode) continue;
+    const mult = 10 ** Number(attr[mi]?.values[s.attributes?.[mi] ?? 0]?.id ?? 0);
+    const obs = Object.entries(s.observations).map(([i, v]) => ({ dato: datoer[Number(i)], kurs: Number(v[0]) / mult })).filter((o) => !!o.dato && o.kurs > 0).sort((a, b) => a.dato.localeCompare(b.dato));
+    const siste = obs[obs.length - 1];
+    if (!siste) continue;
+    const forrige = obs[obs.length - 2];
+    ut.set(kode, {
+      pris: siste.kurs,
+      endring: forrige ? siste.kurs / forrige.kurs - 1 : null,
+      valuta: "NOK",
+      tid: sonetid(siste.dato, 16, 0, "Europe/Oslo")
+    });
+  }
+  return ut;
+}
+function euronextTid(s) {
+  const [, dd, mm, aaaa, hh, mi] = /^(\d\d)\/(\d\d)\/(\d{4})(?: (\d\d):(\d\d))?/.exec(s ?? "") ?? [];
+  if (!aaaa) return null;
+  const dato = `${aaaa}-${mm}-${dd}`;
+  return !hh || hh === "00" && mi === "00" ? sonetid(dato, 17, 0, "Europe/Paris") : sonetid(dato, Number(hh), Number(mi), "Europe/Paris");
+}
+function lesEuronextAksjer(tekst) {
+  const ut = /* @__PURE__ */ new Map();
+  for (const f of csvRader(tekst)) {
+    const [, isin, symbol, marked, valuta] = f;
+    if (!isin || !symbol || !/^[A-Z]{2}[A-Z0-9]{9}\d$/.test(isin) || !/^[A-Z]{3}$/.test(valuta ?? ""))
+      continue;
+    const sist = Number(f[8]), slutt = Number(f[13]);
+    const kandidater = [
+      { kurs: sist, tid: euronextTid(f[9]) },
+      { kurs: slutt, tid: euronextTid(f[14]) }
+    ].filter((x) => x.kurs > 0 && x.tid != null);
+    const best = kandidater.sort((a, b) => b.tid - a.tid)[0];
+    if (!best) continue;
+    for (const [ending, ord] of Object.entries(EURONEXT_BORS)) {
+      if (!(marked ?? "").includes(ord)) continue;
+      const k2 = ending + ":" + symbol;
+      if (!ut.has(k2)) ut.set(k2, { pris: best.kurs, endring: null, valuta, tid: best.tid });
+    }
+  }
+  return ut;
+}
+function lesEuronextIndekser(tekst) {
+  const ut = /* @__PURE__ */ new Map();
+  for (const f of csvRader(tekst)) {
+    const [, isin, symbol, valuta] = f;
+    if (!isin || !symbol || !/^[A-Z]{2}[A-Z0-9]{9}\d$/.test(isin)) continue;
+    const sist = Number(f[7]);
+    if (sist > 0)
+      ut.set(symbol, {
+        pris: sist,
+        endring: null,
+        valuta: valuta || "NOK",
+        tid: euronextTid(f[8])
+      });
+  }
+  return ut;
+}
+function nasdaqSymboler(yahoo) {
+  const p = /^(.+)-P([A-Z])$/.exec(yahoo);
+  if (p) return [p[1] + "^" + p[2]];
+  return yahoo.includes("-") ? [yahoo.replace("-", "/"), yahoo.replace("-", ".")] : [yahoo];
+}
+function lesNasdaqAksjer(tekst, nu) {
+  const ut = /* @__PURE__ */ new Map();
+  const rader = JSON.parse(tekst)?.data?.rows ?? JSON.parse(tekst)?.data?.data?.rows ?? [];
+  const tid = usaTid(nu);
+  for (const r of rader) {
+    const pris = tall(r.lastsale ?? r.lastSalePrice);
+    if (!r.symbol || pris == null || pris <= 0) continue;
+    ut.set(r.symbol, {
+      pris,
+      endring: prosent(r.pctchange ?? r.percentageChange),
+      valuta: "USD",
+      tid
+    });
+  }
+  return ut;
+}
+function lesNasdaqListe(tekst, nu) {
+  const ut = /* @__PURE__ */ new Map();
+  const mnd2 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  for (const r of JSON.parse(tekst)?.data ?? []) {
+    const pris = tall(r.lastSalePrice);
+    if (!r.symbol || pris == null || pris <= 0) continue;
+    const m = /^([A-Z][a-z]{2}) (\d{1,2}), (\d{4})/.exec(String(r.lastTradeTimestamp ?? ""));
+    const dato = m ? `${m[3]}-${String(mnd2.indexOf(m[1]) + 1).padStart(2, "0")}-${m[2].padStart(2, "0")}` : null;
+    ut.set(String(r.symbol).toUpperCase(), {
+      pris,
+      endring: prosent(r.percentageChange),
+      valuta: "USD",
+      tid: usaTid(nu),
+      forrige: tall(r.previousClosePrice),
+      dato
+    });
+  }
+  return ut;
+}
+function lesNorden(tekst, ending, nu) {
+  const ut = /* @__PURE__ */ new Map();
+  const sone = NORDEN[ending]?.sone ?? "Europe/Stockholm";
+  const tid = sesjonstid(nu, sone, [9, 0], [17, 30]);
+  const rader = JSON.parse(tekst)?.data?.instrumentListing?.rows ?? [];
+  for (const r of rader) {
+    const pris = tall(r.lastSalePrice);
+    if (!r.symbol || pris == null || pris <= 0 || !/^[A-Z]{3}$/.test(r.currency ?? "")) continue;
+    ut.set(ending + ":" + r.symbol, {
+      pris,
+      endring: prosent(r.percentageChange),
+      valuta: r.currency,
+      tid
+    });
+  }
+  return ut;
+}
+function lesNasdaqHistorikk(tekst) {
+  const ut = /* @__PURE__ */ new Map();
+  const rader = JSON.parse(tekst)?.data?.tradesTable?.rows ?? [];
+  for (const r of rader) {
+    const m = /^(\d\d)\/(\d\d)\/(\d{4})$/.exec(r.date ?? "");
+    const kurs = tall(r.close);
+    if (m && kurs != null && kurs > 0) ut.set(`${m[3]}-${m[1]}-${m[2]}`, kurs);
+  }
+  return ut;
+}
+var UA, tall, prosent, NORGES_BANK, EURONEXT_CSV, EURONEXT_AKSJER, EURONEXT_INDEKSER, EURONEXT_BORS, csvRader, NASDAQ_AKSJER, NASDAQ_ETF, NASDAQ_LISTE, usaTid, NORDEN, NASDAQ_NORDEN, NASDAQ_HISTORIKK;
+var init_reserve_kilder = __esm({
+  "src/lib/kurs/reserve-kilder.ts"() {
+    "use strict";
+    UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    tall = (s) => {
+      if (typeof s === "number") return Number.isFinite(s) ? s : null;
+      if (typeof s !== "string") return null;
+      const t = s.replace(/[$,%\s]/g, "").replace(/^\+/, "");
+      if (!t || t === "--" || t === "N/A") return null;
+      const n = Number(t);
+      return Number.isFinite(n) ? n : null;
+    };
+    prosent = (s) => {
+      const n = tall(s);
+      return n == null ? null : n / 100;
+    };
+    NORGES_BANK = (koder) => "https://data.norges-bank.no/api/data/EXR/B." + koder.join("+") + ".NOK.SP?format=sdmx-json&lastNObservations=2&locale=no";
+    EURONEXT_CSV = "&initialLetter=&fe_type=csv&fe_decimal_separator=.&fe_date_format=d%2Fm%2FY";
+    EURONEXT_AKSJER = "https://live.euronext.com/en/pd_es/data/stocks/download?mics=" + encodeURIComponent("XOSL,MERK,XOAS,XPAR,ALXP,XAMS,XBRU,ALXB,XLIS,MTAA,EXGM,XMSM,XESM") + EURONEXT_CSV;
+    EURONEXT_INDEKSER = "https://live.euronext.com/en/pd_es/data/index/download?mics=XOSL" + EURONEXT_CSV;
+    EURONEXT_BORS = {
+      OL: "Oslo",
+      PA: "Paris",
+      AS: "Amsterdam",
+      BR: "Brussels",
+      LS: "Lisbon",
+      MI: "Milan",
+      IR: "Dublin"
+    };
+    csvRader = (tekst) => tekst.replace(/^﻿/, "").split("\n").map((l) => l.split(";").map((x) => x.replace(/^"|"\s*$/g, "").trim()));
+    NASDAQ_AKSJER = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true";
+    NASDAQ_ETF = "https://api.nasdaq.com/api/screener/etf?tableonly=true&download=true";
+    NASDAQ_LISTE = "https://api.nasdaq.com/api/quote/watchlist?symbol=comp%7cindex&symbol=spy%7cetf&symbol=dia%7cetf&symbol=acwi%7cetf";
+    usaTid = (nu) => sesjonstid(nu, "America/New_York", [9, 30], [16, 0]);
+    NORDEN = {
+      ST: { marked: "STO", sone: "Europe/Stockholm" },
+      CO: { marked: "CPH", sone: "Europe/Copenhagen" },
+      HE: { marked: "HEL", sone: "Europe/Helsinki" }
+    };
+    NASDAQ_NORDEN = (marked) => `https://api.nasdaq.com/api/nordic/screener/shares?category=MAIN_MARKET&market=${marked}&tableonly=true`;
+    NASDAQ_HISTORIKK = (symbol, fra, til) => `https://api.nasdaq.com/api/quote/${symbol}/historical?assetclass=etf&fromdate=${fra}&todate=${til}&limit=100`;
+  }
+});
+
 // src/lib/kurs/hent.ts
 var hent_exports = {};
 __export(hent_exports, {
+  brukReserve: () => brukReserve,
   forsok: () => forsok,
   hentNyeKurser: () => hentNyeKurser,
   ukjenteNa: () => ukjenteNa
@@ -176,7 +422,7 @@ async function hentJson2(url, ms = 12e3, ekstra = {}) {
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
     const r = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "application/json", ...ekstra },
+      headers: { "User-Agent": UA2, Accept: "application/json", ...ekstra },
       signal: ctrl.signal
     });
     if (!r.ok) {
@@ -265,7 +511,7 @@ async function sparkDel(symbols) {
   }
   return { priser, feil, smake };
 }
-function euronextTid(s) {
+function euronextTid2(s) {
   const [, dd, mm, aaaa, hh, mi] = /^(\d\d)\/(\d\d)\/(\d{4})(?: (\d\d):(\d\d))?/.exec(s ?? "") ?? [];
   if (!aaaa) return null;
   return !hh || hh === "00" && mi === "00" ? Date.UTC(+aaaa, +(mm ?? 1) - 1, +(dd ?? 1), 16) / 1e3 : Date.UTC(+aaaa, +(mm ?? 1) - 1, +(dd ?? 1), +hh - 1, +(mi ?? 0)) / 1e3;
@@ -275,7 +521,7 @@ async function euronextListe(url, merke = "") {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 2e4);
   try {
-    const r = await fetch(url, { headers: { "User-Agent": UA }, signal: ctrl.signal });
+    const r = await fetch(url, { headers: { "User-Agent": UA2 }, signal: ctrl.signal });
     if (!r.ok) {
       if (merke) forsok[merke] = "HTTP " + r.status;
       return ut;
@@ -289,8 +535,8 @@ async function euronextListe(url, merke = "") {
       const slutt = Number(f[13]);
       const sluttOk = !(sist > 0) || slutt / sist > 0.5 && slutt / sist < 2;
       const kandidater = [
-        { kurs: sist, tid: euronextTid(f[9]) },
-        ...sluttOk ? [{ kurs: slutt, tid: euronextTid(f[14]) }] : []
+        { kurs: sist, tid: euronextTid2(f[9]) },
+        ...sluttOk ? [{ kurs: slutt, tid: euronextTid2(f[14]) }] : []
       ].filter(
         (x) => endelig(x.kurs) && x.kurs > 0 && endelig(x.tid)
       );
@@ -368,6 +614,125 @@ function lagDagFraGrunnlag(dato, tid) {
 function verdi(pris, valuta, endring, t) {
   return endelig(t) ? [pris, valuta, endring, Math.round(t)] : [pris, valuta, endring];
 }
+function endringMotLagret(gml, k2) {
+  if (!Array.isArray(gml) || !endelig(gml[0]) || gml[0] <= 0 || gml[1] !== k2.valuta) return null;
+  if (!endelig(gml[3]) || !endelig(k2.tid)) return null;
+  const dager = dagNrR(k2.tid) - dagNrR(gml[3]);
+  if (dager === 0) return endelig(gml[2]) ? k2.pris * (1 + gml[2]) / gml[0] - 1 : null;
+  if (dager > 0 && dager <= 4) return k2.pris / gml[0] - 1;
+  return null;
+}
+function rimelig(gml, k2) {
+  if (!Array.isArray(gml) || !endelig(gml[0]) || gml[0] <= 0) return true;
+  if (gml[1] !== k2.valuta) return false;
+  const f = k2.pris / gml[0];
+  if (f < 0.5 || f > 2) return false;
+  return !(endelig(gml[3]) && endelig(k2.tid) && k2.tid < gml[3]);
+}
+async function brukReserve(v) {
+  const { live, dag: dag2, settP, dato, nu, ferske } = v;
+  const les = async (merke, url, tolk) => {
+    const t = await (v.hentTekst ?? lagHentTekst(forsok))(merke)(url);
+    if (t == null) return null;
+    try {
+      const r = tolk(t);
+      const n = r instanceof Map ? r.size : 1;
+      if (!(merke in forsok)) forsok[merke] = "ok (" + n + ")";
+      return r;
+    } catch (e) {
+      forsok[merke] = "kunne ikke lese: " + (e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  };
+  const koder = Object.keys(VALUTA);
+  const [nb, euAksjer, euIndekser, usAksjer, usEtf, usListe, ...norden] = await Promise.all([
+    les("r-norgesbank", NORGES_BANK(koder), lesNorgesBank),
+    les("r-euronext-aksjer", EURONEXT_AKSJER, lesEuronextAksjer),
+    les("r-euronext-indekser", EURONEXT_INDEKSER, lesEuronextIndekser),
+    les("r-nasdaq-aksjer", NASDAQ_AKSJER, (t) => lesNasdaqAksjer(t, nu)),
+    les("r-nasdaq-etf", NASDAQ_ETF, (t) => lesNasdaqAksjer(t, nu)),
+    les("r-nasdaq-indekser", NASDAQ_LISTE, (t) => lesNasdaqListe(t, nu)),
+    ...Object.entries(NORDEN).map(
+      ([ending, n]) => les("r-norden-" + ending, NASDAQ_NORDEN(n.marked), (t) => lesNorden(t, ending, nu))
+    )
+  ]);
+  if (nb?.size) {
+    const fxe = {};
+    for (const [kode, k2] of nb) {
+      if (!koder.includes(kode)) continue;
+      const kurs = +k2.pris.toFixed(6);
+      live.fx[kode] = kurs;
+      dag2.fx[kode] = kurs;
+      if (k2.endring != null) fxe[kode] = +k2.endring.toFixed(6);
+      leggIx(dag2, kode, dato, kurs);
+    }
+    if (Object.keys(fxe).length) live.fxe = fxe;
+    ferske.add("fx");
+  }
+  const osebx = euIndekser?.get("OSEBX");
+  if (osebx && INDEKSER["OSEBX"]) leggIx(dag2, "OSEBX", dato, osebx.pris);
+  const comp = usListe?.get("COMP");
+  if (comp && INDEKSER["COMP"]) leggIx(dag2, "COMP", dato, comp.pris);
+  const acwi = usListe?.get("ACWI");
+  if (acwi && INDEKSER["ACWI"]) leggIx(dag2, "ACWI", dato, acwi.pris);
+  await Promise.all(
+    [
+      ["SPX", "SPY"],
+      ["DJI", "DIA"]
+    ].map(async ([id, etf2]) => {
+      const e = usListe?.get(etf2);
+      if (!INDEKSER[id] || !e || !e.dato) return;
+      const f\u00F8r = (Array.isArray(dag2.ix[id]) ? dag2.ix[id] : []).filter((x) => Array.isArray(x) && typeof x[0] === "string" && x[0] < e.dato).sort((a, b) => a[0].localeCompare(b[0])).pop();
+      if (!f\u00F8r || !endelig(f\u00F8r[1])) return;
+      const fra = new Date(Date.parse(f\u00F8r[0]) - 31 * 864e5).toISOString().slice(0, 10);
+      const hist = await les(
+        "r-historikk-" + etf2,
+        NASDAQ_HISTORIKK(etf2, fra, e.dato),
+        lesNasdaqHistorikk
+      );
+      const dagen = [...hist?.keys() ?? []].filter((d) => d <= f\u00F8r[0]).sort().pop();
+      const slutt = dagen ? hist.get(dagen) : void 0;
+      if (!slutt) return;
+      leggIx(dag2, id, dato, +(f\u00F8r[1] / slutt * e.pris).toFixed(2));
+    })
+  );
+  const tell = {};
+  for (const [key, [symbol]] of Object.entries(AKSJER)) {
+    if (!symbol) continue;
+    const prikk = symbol.lastIndexOf(".");
+    const ending = prikk > 0 ? symbol.slice(prikk + 1) : "";
+    const base = prikk > 0 ? symbol.slice(0, prikk) : symbol;
+    let k2;
+    let marked = "";
+    if (!ending || ending.length > 2) {
+      for (const s of nasdaqSymboler(symbol)) if (k2 = usAksjer?.get(s)) break;
+      marked = "usa";
+    } else if (EURONEXT_BORS[ending]) {
+      k2 = euAksjer?.get(ending + ":" + base) ?? euAksjer?.get(ending + ":" + base.replace(/-/g, " "));
+      marked = ending === "OL" ? "oslo" : "europa";
+    } else if (NORDEN[ending]) {
+      const i = Object.keys(NORDEN).indexOf(ending);
+      k2 = norden[i]?.get(ending + ":" + base.replace(/-/g, " "));
+      marked = "europa";
+    }
+    if (!k2) continue;
+    const gml = live.p[key];
+    if (!rimelig(gml, k2)) continue;
+    settP(key, verdi(k2.pris, k2.valuta, k2.endring ?? endringMotLagret(gml, k2), k2.tid));
+    ferske.add(marked);
+    tell[marked] = (tell[marked] ?? 0) + 1;
+  }
+  let etf = 0;
+  for (const [key, [symbol, valuta]] of Object.entries(FOND)) {
+    if (!symbol || symbol.includes(".") || valuta !== "USD") continue;
+    const k2 = usEtf?.get(symbol);
+    if (!k2 || !rimelig(live.p[key], k2)) continue;
+    settP(key, verdi(k2.pris, k2.valuta, k2.endring, k2.tid));
+    etf++;
+  }
+  if (etf) ferske.add("fond");
+  forsok["reserve-antall"] = JSON.stringify({ ...tell, etf });
+}
 async function hentNyeKurser(forrige, tilstand) {
   const nu = /* @__PURE__ */ new Date();
   const tid = nu.toISOString();
@@ -407,17 +772,20 @@ async function hentNyeKurser(forrige, tilstand) {
   const fenaSymboler = slice.map((l) => l.slice(l.indexOf("\0") + 1)).filter((s) => s.length > 0 && kjent(s));
   const medEuronext = tilstand.fylke % 4 === 0;
   const tom = Promise.resolve(/* @__PURE__ */ new Map());
+  const yahooPause = !!tilstand.yahooNede && nu.getTime() - Date.parse(tilstand.yahooNede) < YAHOO_PAUSE_MS;
+  if (yahooPause) forsok["yahoo"] = "pause siden " + tilstand.yahooNede;
   const [valutaM, indeksM, osloM, kryptoM, sliceM, euronextFondM, euronextEtfM] = await Promise.all(
     [
       spark(valutasymboler, "valuta"),
-      spark(Object.values(INDEKSER), "indeks"),
-      spark(oslosymboler, "oslo"),
+      yahooPause ? tom : spark(Object.values(INDEKSER), "indeks"),
+      yahooPause ? tom : spark(oslosymboler, "oslo"),
       hentKrypto(krypto, "krypto"),
-      spark(fenaSymboler, "fena"),
-      medEuronext ? euronextListe(EURONEXT_FOND, "euronext-fond") : tom,
-      medEuronext ? euronextListe(EURONEXT_ETF, "euronext-etf") : tom
+      yahooPause ? tom : spark(fenaSymboler, "fena"),
+      medEuronext || yahooPause ? euronextListe(EURONEXT_FOND, "euronext-fond") : tom,
+      medEuronext || yahooPause ? euronextListe(EURONEXT_ETF, "euronext-etf") : tom
     ]
   );
+  const yahooStengt = yahooPause ? !valutaM.size : !valutaM.size && !indeksM.size && !osloM.size && Object.values(forsok).some((v) => /\b429\b/.test(v));
   const usdNok = valutaM.get("USDNOK=X")?.pris ?? null;
   const fxe = {};
   let valutaFersk = false;
@@ -467,7 +835,7 @@ async function hentNyeKurser(forrige, tilstand) {
     ([id, s]) => !kryptoM?.["k:" + id] && kjent(s)
   );
   const usdKurs = usdNok ?? live.fx.USD ?? null;
-  if (manglerKrypto.length && endelig(usdKurs) && usdKurs > 0) {
+  if (manglerKrypto.length && endelig(usdKurs) && usdKurs > 0 && !yahooStengt) {
     const yahooM = await spark(
       manglerKrypto.map(([, s]) => s),
       "krypto-yahoo"
@@ -518,7 +886,7 @@ async function hentNyeKurser(forrige, tilstand) {
       const gml = live.p[key];
       const gmlTid = Array.isArray(gml) && endelig(gml[3]) ? gml[3] : 0;
       if (!endelig(k2.tid) || k2.tid <= gmlTid) continue;
-      if (y && kjent(y[0])) {
+      if (y && kjent(y[0]) && !yahooStengt) {
         if (!etf) continue;
         if (gml?.[1] !== k2.valuta && dagNr(k2.tid) <= dagNr(gmlTid)) continue;
       }
@@ -528,33 +896,44 @@ async function hentNyeKurser(forrige, tilstand) {
         if (dager === 0) endring = endelig(gml[2]) ? k2.pris * (1 + gml[2]) / gml[0] - 1 : null;
         else if (dager <= 4) endring = k2.pris / gml[0] - 1;
       }
-      settP(key, verdi(k2.pris, k2.valuta ?? "NOK", endring, k2.tid));
+      const fondValuta = !etf && y?.[1] ? y[1] : k2.valuta ?? "NOK";
+      settP(key, verdi(k2.pris, fondValuta, fondValuta === k2.valuta ? endring : null, k2.tid));
       euronextAntall++;
     }
   if (medEuronext) forsok["euronext-nye"] = String(euronextAntall);
   if (euronextAntall) ferske.add("fond");
   for (const m of ferske) live.ts[m] = tid;
+  if (yahooStengt) {
+    forsok["yahoo"] = "stengt (429), bruker reservekildene";
+    await brukReserve({ live, dag: dag2, settP, dato, nu: nu.getTime(), tid, ferske });
+    for (const m of ferske) live.ts[m] = tid;
+  }
   for (const s of ukjenteNa) ukjente[s] = dato;
   forsok["ukjente-symboler"] = String(Object.keys(ukjente).length);
   return {
     live,
     dag: dag2,
-    tilstand: { fylke: (tilstand.fylke + 1) % RUNDER_PER_TIME, ukjente }
+    tilstand: {
+      fylke: (tilstand.fylke + 1) % RUNDER_PER_TIME,
+      ukjente,
+      ...yahooStengt ? { yahooNede: yahooPause && tilstand.yahooNede ? tilstand.yahooNede : tid } : {}
+    }
   };
 }
-var G, UA, SPARK, COINGECKO, EURONEXT_CSV, EURONEXT_FOND, EURONEXT_ETF, AKSJER, FOND, VALUTA, KRYPTO_YAHOO, EURONEXT, INDEKSER, RUNDER_PER_TIME, forsok, endelig, MAKS_SYMBOLER, ukjenteNa, UKJENT_DAGER;
+var G, UA2, SPARK, COINGECKO, EURONEXT_CSV2, EURONEXT_FOND, EURONEXT_ETF, AKSJER, FOND, VALUTA, KRYPTO_YAHOO, EURONEXT, INDEKSER, RUNDER_PER_TIME, forsok, endelig, MAKS_SYMBOLER, ukjenteNa, YAHOO_PAUSE_MS, UKJENT_DAGER, dagNrR;
 var init_hent = __esm({
   "src/lib/kurs/hent.ts"() {
     "use strict";
     init_grunnlag();
     init_krypto_yahoo();
+    init_reserve_kilder();
     G = grunnlag_default;
-    UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    UA2 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     SPARK = "https://query2.finance.yahoo.com/v7/finance/spark?symbols=";
     COINGECKO = "https://api.coingecko.com/api/v3/simple/price";
-    EURONEXT_CSV = "&initialLetter=&fe_type=csv&fe_decimal_separator=.&fe_date_format=d%2Fm%2FY";
-    EURONEXT_FOND = "https://live.euronext.com/en/pd_es/data/funds/download?mics=WOMF" + EURONEXT_CSV;
-    EURONEXT_ETF = "https://live.euronext.com/en/pd_es/data/track/download?mics=" + encodeURIComponent("XPAR,XAMS,XBRU,XLIS,XMSM,ETFP,XOSL,XMIL,MTAA,ETLX") + EURONEXT_CSV;
+    EURONEXT_CSV2 = "&initialLetter=&fe_type=csv&fe_decimal_separator=.&fe_date_format=d%2Fm%2FY";
+    EURONEXT_FOND = "https://live.euronext.com/en/pd_es/data/funds/download?mics=WOMF" + EURONEXT_CSV2;
+    EURONEXT_ETF = "https://live.euronext.com/en/pd_es/data/track/download?mics=" + encodeURIComponent("XPAR,XAMS,XBRU,XLIS,XMSM,ETFP,XOSL,XMIL,MTAA,ETLX") + EURONEXT_CSV2;
     AKSJER = G.aksjer;
     FOND = G.fond;
     VALUTA = G.valuta;
@@ -566,7 +945,9 @@ var init_hent = __esm({
     endelig = (x) => typeof x === "number" && isFinite(x);
     MAKS_SYMBOLER = 20;
     ukjenteNa = /* @__PURE__ */ new Set();
+    YAHOO_PAUSE_MS = 60 * 60 * 1e3;
     UKJENT_DAGER = 7;
+    dagNrR = (t) => Math.floor(t / 86400);
   }
 });
 
@@ -1057,29 +1438,29 @@ function lesMarkeder(json) {
   if (!Array.isArray(json)) return null;
   const ut = {};
   for (const c of json) {
-    if (!c || typeof c.id !== "string" || tall(c.market_cap) == null) continue;
+    if (!c || typeof c.id !== "string" || tall2(c.market_cap) == null) continue;
     ut[c.id] = [
-      tall(c.market_cap_rank),
-      tall(c.market_cap),
-      tall(c.total_volume),
-      tall(c.ath),
-      tall(c.ath_change_percentage),
+      tall2(c.market_cap_rank),
+      tall2(c.market_cap),
+      tall2(c.total_volume),
+      tall2(c.ath),
+      tall2(c.ath_change_percentage),
       typeof c.ath_date === "string" ? c.ath_date : null,
-      tall(c.circulating_supply),
-      tall(c.total_supply),
-      tall(c.max_supply),
-      tall(c.fully_diluted_valuation),
-      tall(c.price_change_percentage_7d_in_currency),
-      tall(c.price_change_percentage_30d_in_currency),
-      tall(c.price_change_percentage_1y_in_currency),
-      tall(c.current_price),
-      tall(c.atl),
+      tall2(c.circulating_supply),
+      tall2(c.total_supply),
+      tall2(c.max_supply),
+      tall2(c.fully_diluted_valuation),
+      tall2(c.price_change_percentage_7d_in_currency),
+      tall2(c.price_change_percentage_30d_in_currency),
+      tall2(c.price_change_percentage_1y_in_currency),
+      tall2(c.current_price),
+      tall2(c.atl),
       typeof c.atl_date === "string" ? c.atl_date : null
     ];
   }
   return ut;
 }
-var PER_SIDE, markedsAdresse, KRYPTO_FELT, tall;
+var PER_SIDE, markedsAdresse, KRYPTO_FELT, tall2;
 var init_krypto = __esm({
   "src/lib/vedlikehold/krypto.ts"() {
     "use strict";
@@ -1103,7 +1484,7 @@ var init_krypto = __esm({
       "atl",
       "atlDato"
     ];
-    tall = (x) => typeof x === "number" && isFinite(x) ? x : null;
+    tall2 = (x) => typeof x === "number" && isFinite(x) ? x : null;
   }
 });
 
@@ -1440,7 +1821,7 @@ function lesNasdaq(json, idag) {
     ];
     if (rad[1] + rad[2] + rad[3] > 0) h.push(rad);
   }
-  const snitt = tall2(o.priceTarget);
+  const snitt = tall3(o.priceTarget);
   const ut = { k: "n", d: idag };
   if (a[0] + a[1] + a[2] > 0) {
     ut.a = a;
@@ -1453,7 +1834,7 @@ function lesNasdaq(json, idag) {
     if (i >= 0) h[i] = [denne, ...a];
   }
   if (h.length) ut.h = h.sort((x, y) => x[0] < y[0] ? -1 : 1).slice(-12);
-  if (snitt) ut.m = [snitt, tall2(o.lowPriceTarget), tall2(o.highPriceTarget), "USD", null];
+  if (snitt) ut.m = [snitt, tall3(o.lowPriceTarget), tall3(o.highPriceTarget), "USD", null];
   if (!ut.a && !ut.m) return { k: "n", d: idag, x: 1 };
   return ut;
 }
@@ -1499,17 +1880,17 @@ function lesYahoo(json, idag, valuta, marked = "eu") {
     ut.h = h.sort((x, y) => x[0] < y[0] ? -1 : 1);
   }
   const f = res.financialData ?? {};
-  const snitt = tall2(f.targetMeanPrice);
+  const snitt = tall3(f.targetMeanPrice);
   if (snitt) {
     const cur = String(res.price?.currency ?? valuta);
     const del = cur === "GBp" || cur === "GBX" ? 100 : 1;
     const v = (x) => x == null ? null : x / del;
     ut.m = [
       snitt / del,
-      v(tall2(f.targetLowPrice)),
-      v(tall2(f.targetHighPrice)),
+      v(tall3(f.targetLowPrice)),
+      v(tall3(f.targetHighPrice)),
       del === 100 ? "GBP" : cur || valuta,
-      tall2(f.numberOfAnalystOpinions)
+      tall3(f.numberOfAnalystOpinions)
     ];
   }
   const grense = new Date(Date.parse(idag + "T00:00:00Z") - 90 * 864e5).toISOString().slice(0, 10);
@@ -1570,7 +1951,7 @@ async function kjorAnbefalinger(lager, valg = {}) {
   const tell = (k2) => t.telling[k2] = (t.telling[k2] ?? 0) + 1;
   let okt = null;
   async function nyOkt() {
-    const fc = await hent("https://fc.yahoo.com/", { "User-Agent": UA2 }, 5e3, {
+    const fc = await hent("https://fc.yahoo.com/", { "User-Agent": UA3 }, 5e3, {
       redirect: "manual"
     });
     const cookie = cookieFra(fc.hoder);
@@ -1580,7 +1961,7 @@ async function kjorAnbefalinger(lager, valg = {}) {
     }
     const c = await hent(
       "https://query2.finance.yahoo.com/v1/test/getcrumb",
-      { "User-Agent": UA2, Cookie: cookie, Accept: "text/plain" },
+      { "User-Agent": UA3, Cookie: cookie, Accept: "text/plain" },
       5e3
     );
     const crumb = (c.tekst ?? "").trim();
@@ -1607,7 +1988,7 @@ async function kjorAnbefalinger(lager, valg = {}) {
   async function fraYahoo(sym, valuta, marked, igjen = true) {
     const o = await yahooOkt();
     if (!o) return null;
-    const h = await hent(yahooAdresse(sym, o.crumb), { "User-Agent": UA2, Cookie: o.cookie }, ms);
+    const h = await hent(yahooAdresse(sym, o.crumb), { "User-Agent": UA3, Cookie: o.cookie }, ms);
     if (h.status === 401 && igjen) {
       if (!await fornyOkt()) return null;
       return fraYahoo(sym, valuta, marked, false);
@@ -1685,7 +2066,7 @@ async function kjorAnbefalinger(lager, valg = {}) {
   if (feil) t.forsok["lagre"] = feil;
   return { steg, ms: Date.now() - start, forsok: t.forsok };
 }
-var ANB_BOTTER, AKSJER2, ALLE, VIKTIGE, viktig, ANDRE, KJOP, HOLD, SELG, heltall, tall2, mnd, nasdaqAdresse, yahooAdresse, TIDSSONE, datoI, UA2, NASDAQ_HODE, TIME;
+var ANB_BOTTER, AKSJER2, ALLE, VIKTIGE, viktig, ANDRE, KJOP, HOLD, SELG, heltall, tall3, mnd, nasdaqAdresse, yahooAdresse, TIDSSONE, datoI, UA3, NASDAQ_HODE, TIME;
 var init_anbefalinger = __esm({
   "src/lib/vedlikehold/anbefalinger.ts"() {
     "use strict";
@@ -1704,7 +2085,7 @@ var init_anbefalinger = __esm({
     HOLD = /^(hold|neutral|equal[- ]weight|market perform|sector perform|peer perform|in-line|in line|sector weight|perform|mixed|fair value|market weight|moderate sell|reduce weight)$/;
     SELG = /^(strong sell|sell|underperform|market underperform|sector underperform|underweight|reduce|negative|underperformer)$/;
     heltall = (x) => typeof x === "number" && isFinite(x) && x >= 0 ? Math.round(x) : 0;
-    tall2 = (x) => {
+    tall3 = (x) => {
       const v = x && typeof x === "object" ? x.raw : x;
       return typeof v === "number" && isFinite(v) && v > 0 ? v : null;
     };
@@ -1731,9 +2112,9 @@ var init_anbefalinger = __esm({
         return new Date(sekunder * 1e3).toISOString().slice(0, 10);
       }
     };
-    UA2 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    UA3 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     NASDAQ_HODE = {
-      "User-Agent": UA2,
+      "User-Agent": UA3,
       Accept: "application/json, text/plain, */*",
       Origin: "https://www.nasdaq.com",
       Referer: "https://www.nasdaq.com/"
@@ -1884,7 +2265,7 @@ __export(borskart_exports, {
   ANTALL_KILDER: () => ANTALL_KILDER,
   EU_NOKLER: () => EU_NOKLER,
   KILDER: () => KILDER,
-  NASDAQ_LISTE: () => NASDAQ_LISTE,
+  NASDAQ_LISTE: () => NASDAQ_LISTE2,
   STATISK: () => STATISK,
   alleAntallUs: () => alleAntallUs,
   bransjeFra: () => bransjeFra,
@@ -1893,7 +2274,7 @@ __export(borskart_exports, {
   lagAntall: () => lagAntall,
   lagRad: () => lagRad,
   lesMcap: () => lesMcap,
-  lesNasdaqListe: () => lesNasdaqListe,
+  lesNasdaqListe: () => lesNasdaqListe2,
   lesSpark: () => lesSpark,
   mcapAdresse: () => mcapAdresse,
   selskapsnavn: () => selskapsnavn,
@@ -1911,13 +2292,13 @@ function lesMcap(json) {
   const l = a.filter((x) => x?.reportedValue?.raw > 0 && x.asOfDate).pop();
   return l ? [l.reportedValue.raw, String(l.currencyCode || ""), String(l.asOfDate)] : null;
 }
-function lesNasdaqListe(json) {
+function lesNasdaqListe2(json) {
   const rows = json?.data?.rows;
   if (!Array.isArray(rows) || rows.length < 100) return null;
   const per = /* @__PURE__ */ new Map();
   for (const r of rows) {
     const sym = String(r?.symbol ?? "").replace("/", "-");
-    const key = "a:us:" + sym, mcap = tall3(r.marketCap), kurs = tall3(r.lastsale);
+    const key = "a:us:" + sym, mcap = tall4(r.marketCap), kurs = tall4(r.lastsale);
     const navn = String(r.name ?? "");
     if (!G2[key] || !(mcap > 0) || !(kurs > 0)) continue;
     if (/\b(zones|notes?|debentures?|preferred|warrants?|units?|rights?)\b/i.test(navn)) continue;
@@ -1927,7 +2308,7 @@ function lesNasdaqListe(json) {
       mcap,
       kurs,
       land: USA_UTE.has(sym) ? "United States" : String(r.country || "United States"),
-      volum: tall3(r.volume) ?? 0,
+      volum: tall4(r.volume) ?? 0,
       sektor: r.sector ? String(r.sector) : null
     };
     const n = selskapsnavn(navn) + "|" + x.land;
@@ -2019,7 +2400,7 @@ function alleAntallUs(json) {
   const ut = {};
   for (const r of Array.isArray(json?.data?.rows) ? json.data.rows : []) {
     const key = "a:us:" + String(r?.symbol ?? "").replace("/", "-");
-    const mcap = tall3(r?.marketCap), kurs = tall3(r?.lastsale);
+    const mcap = tall4(r?.marketCap), kurs = tall4(r?.lastsale);
     if (G2[key] && mcap > 0 && kurs > 0) ut[key] = mcap / kurs;
   }
   return ut;
@@ -2077,7 +2458,7 @@ async function kjorBorskart(lager, valg = {}) {
     const nokler = EU_NOKLER.slice(t.pos ?? 0, (t.pos ?? 0) + n);
     const svar = await Promise.all(
       nokler.map(
-        (k2) => hent(mcapAdresse(G2[k2][0], naMs), { "User-Agent": UA3, Accept: "application/json" }, ms)
+        (k2) => hent(mcapAdresse(G2[k2][0], naMs), { "User-Agent": UA4, Accept: "application/json" }, ms)
       )
     );
     let ferdig = 0;
@@ -2108,9 +2489,9 @@ async function kjorBorskart(lager, valg = {}) {
       t.pos = 0;
     }
   } else if (t.fase === "us") {
-    const h = await hent(NASDAQ_LISTE, NASDAQ_HODE2, Math.max(ms, 12e3));
+    const h = await hent(NASDAQ_LISTE2, NASDAQ_HODE2, Math.max(ms, 12e3));
     const json = somJson(h);
-    const us = lesNasdaqListe(json);
+    const us = lesNasdaqListe2(json);
     t.forsok["nasdaq-liste"] = us ? "ok " + idag : h.feil ?? "ukjent svar";
     if (!us) t.nasdaqFeil = (t.nasdaqFeil ?? 0) + 1;
     if (us || (t.nasdaqFeil ?? 0) >= 288) {
@@ -2145,7 +2526,7 @@ async function kjorBorskart(lager, valg = {}) {
       const del = t.valgt.slice(t.pos, t.pos + 20);
       const h = await hent(
         sparkAdresse(del.map(([k2]) => G2[k2][0])),
-        { "User-Agent": UA3, Accept: "application/json" },
+        { "User-Agent": UA4, Accept: "application/json" },
         ms
       );
       const serier = h.status === 200 ? lesSpark(somJson(h)) : null;
@@ -2157,7 +2538,7 @@ async function kjorBorskart(lager, valg = {}) {
             if (Date.now() - start > ms * 2) break;
             const e = await hent(
               sparkAdresse([G2[k2][0]]),
-              { "User-Agent": UA3, Accept: "application/json" },
+              { "User-Agent": UA4, Accept: "application/json" },
               ms
             );
             if (e.status !== 200 && e.status !== 404) break;
@@ -2207,7 +2588,7 @@ async function kjorBorskart(lager, valg = {}) {
   if (feil) t.forsok["lagre"] = feil;
   return { steg, ms: Date.now() - start, fase: t.fase, forsok: t.forsok };
 }
-var G2, S, STATISK, ANTALL, EUROPA_LAND, USA_UTE, OGSA_I_EUROPA, REGLER, NASDAQ_SEKTOR, EU_NOKLER, UA3, NASDAQ_HODE2, NASDAQ_LISTE, mcapAdresse, sparkAdresse, DAG2, iso, tall3, sig, selskapsnavn, ANTALL_KILDER, KILDER;
+var G2, S, STATISK, ANTALL, EUROPA_LAND, USA_UTE, OGSA_I_EUROPA, REGLER, NASDAQ_SEKTOR, EU_NOKLER, UA4, NASDAQ_HODE2, NASDAQ_LISTE2, mcapAdresse, sparkAdresse, DAG2, iso, tall4, sig, selskapsnavn, ANTALL_KILDER, KILDER;
 var init_borskart2 = __esm({
   "src/lib/vedlikehold/borskart.ts"() {
     "use strict";
@@ -2226,19 +2607,19 @@ var init_borskart2 = __esm({
     REGLER = borskart_regler_default.regler.map(([g, r]) => [g, new RegExp(r, "i")]);
     NASDAQ_SEKTOR = borskart_regler_default.nasdaqSektor;
     EU_NOKLER = Object.keys(G2).filter((k2) => /^a:(eu|no):/.test(k2) && G2[k2]?.[0]).sort((a, b) => +STATISK.has(b) - +STATISK.has(a));
-    UA3 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    UA4 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     NASDAQ_HODE2 = {
-      "User-Agent": UA3,
+      "User-Agent": UA4,
       Accept: "application/json, text/plain, */*",
       Origin: "https://www.nasdaq.com",
       Referer: "https://www.nasdaq.com/"
     };
-    NASDAQ_LISTE = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true";
+    NASDAQ_LISTE2 = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true";
     mcapAdresse = (sym, naa) => `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(sym)}?type=trailingMarketCap&period1=${Math.floor(naa / 1e3) - 40 * 86400}&period2=${Math.floor(naa / 1e3) + 86400}`;
     sparkAdresse = (symboler) => "https://query2.finance.yahoo.com/v7/finance/spark?range=2y&interval=1d&symbols=" + symboler.map(encodeURIComponent).join(",");
     DAG2 = 864e5;
     iso = (ms) => new Date(ms).toISOString().slice(0, 10);
-    tall3 = (s) => {
+    tall4 = (s) => {
       const v = parseFloat(String(s ?? "").replace(/[$,]/g, ""));
       return isFinite(v) ? v : null;
     };
@@ -2308,7 +2689,7 @@ async function kjorUtbytte(lager, valg = {}) {
   const nokler = t.nokler.slice(t.pos, t.pos + n);
   const svar = await Promise.all(
     nokler.map(
-      (k2) => hent(utbytteAdresse(G3[k2][0]), { "User-Agent": UA4, Accept: "application/json" }, ms)
+      (k2) => hent(utbytteAdresse(G3[k2][0]), { "User-Agent": UA5, Accept: "application/json" }, ms)
     )
   );
   let ferdig = 0;
@@ -2367,7 +2748,7 @@ async function kjorUtbytte(lager, valg = {}) {
   if (feil) t.forsok = feil;
   return { steg, ms: Date.now() - start, fase: t.fase, forsok: t.forsok };
 }
-var G3, STATISK_BK, STATISK2, UA4, DAG3, iso2, KILDER2, utbytteAdresse;
+var G3, STATISK_BK, STATISK2, UA5, DAG3, iso2, KILDER2, utbytteAdresse;
 var init_utbytte2 = __esm({
   "src/lib/vedlikehold/utbytte.ts"() {
     "use strict";
@@ -2378,7 +2759,7 @@ var init_utbytte2 = __esm({
     G3 = grunnlag_default.aksjer;
     STATISK_BK = borskart_default;
     STATISK2 = utbytte_default;
-    UA4 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    UA5 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     DAG3 = 864e5;
     iso2 = (ms) => new Date(ms).toISOString().slice(0, 10);
     KILDER2 = "Utbytte de siste 12 m\xE5nedene: Yahoo Finance, hentet av kursjobben hver uke. Direkteavkastningen er utbyttet delt p\xE5 kursen n\xE5.";
@@ -2523,7 +2904,7 @@ async function kjorNyheter(lager, valg = {}) {
   }
   return { steg, ms: Date.now() - start, forsok: k2.forsok };
 }
-var G4, DAG4, iso3, leggTil2, GRENSE, MIN_VERDI, MAKS_ENDRING, DAGER, MAKS_ANTALL, kalenderAdresse, UA5, NASDAQ_HODE3, MND;
+var G4, DAG4, iso3, leggTil2, GRENSE, MIN_VERDI, MAKS_ENDRING, DAGER, MAKS_ANTALL, kalenderAdresse, UA6, NASDAQ_HODE3, MND;
 var init_nyheter = __esm({
   "src/lib/vedlikehold/nyheter.ts"() {
     "use strict";
@@ -2541,9 +2922,9 @@ var init_nyheter = __esm({
     DAGER = 30;
     MAKS_ANTALL = 400;
     kalenderAdresse = (dato) => `https://api.nasdaq.com/api/calendar/earnings?date=${dato}`;
-    UA5 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    UA6 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     NASDAQ_HODE3 = {
-      "User-Agent": UA5,
+      "User-Agent": UA6,
       Accept: "application/json, text/plain, */*",
       Origin: "https://www.nasdaq.com",
       Referer: "https://www.nasdaq.com/"
@@ -2646,7 +3027,8 @@ function tilstate(t) {
       (e) => typeof e[1] === "string"
     )
   ) : {};
-  return { fylke: Math.max(0, Math.floor(fylke)), ukjente };
+  const yahooNede = typeof o.yahooNede === "string" ? o.yahooNede : void 0;
+  return { fylke: Math.max(0, Math.floor(fylke)), ukjente, ...yahooNede ? { yahooNede } : {} };
 }
 
 // scripts/kursjobb-github.ts
