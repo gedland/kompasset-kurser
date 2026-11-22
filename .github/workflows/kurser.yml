@@ -1,0 +1,69 @@
+# Kursene til Investeringskompasset (22.11.2026). Kopi av kursjobb/kurser.yml i gedland/github-site-connector.
+# Kjører hvert 5. minutt (GitHub kan forsinke planlagte kjøringer noen minutter), henter kursene og
+# legger dem i grenen «data», som siden leser fra raw.githubusercontent.com. Gratis i et offentlig repo.
+name: Kurser
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kurser
+  cancel-in-progress: false
+
+jobs:
+  kurser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: kursjobb.mjs
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Hent forrige kurser (grenen data)
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git clone --quiet --depth 1 --branch data \
+              "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ut
+          else
+            mkdir ut
+          fi
+
+      # Yahoos økt (privat-…) publiseres aldri; den tas vare på i cachen mellom kjøringene
+      - uses: actions/cache/restore@v4
+        with:
+          path: privat
+          key: privat-${{ github.run_id }}
+          restore-keys: privat-
+
+      - name: Kursjobben
+        run: node kursjobb.mjs ut privat
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: privat
+          key: privat-${{ github.run_id }}
+
+      # Én commit i grenen data (den skrives over hver gang), så repoet ikke vokser
+      - name: Lagre i grenen data
+        run: |
+          cd ut
+          rm -rf .git
+          git init --quiet -b data
+          git config user.name "kursjobben"
+          git config user.email "kursjobben@users.noreply.github.com"
+          touch .nojekyll
+          git add -A
+          git commit --quiet -m "Kurser $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --quiet --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
