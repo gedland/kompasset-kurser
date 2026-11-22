@@ -7,6 +7,10 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+  # Kjører med en gang når jobben eller workflowen er oppdatert
+  push:
+    branches: [main]
+    paths: [kursjobb.mjs, .github/workflows/kurser.yml]
 
 permissions:
   contents: write
